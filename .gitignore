@@ -1,3 +1,4 @@
+# Артефакты сборки ядерного модуля
 *.o
 *.ko
 *.mod
@@ -5,8 +6,19 @@
 *.mod.o
 *.symvers
 *.order
+modules.builtin
+modules.builtin.modinfo
 .tmp_versions/
-.*.cmd
 .cache.mk
+Module.symvers
+modules.order
+
+# Userspace CLI
 bunglefs_cli
-disk.img
+
+# Образ диска для тестов
+*.img
+
+# IDE
+*idea/
+*.iml
