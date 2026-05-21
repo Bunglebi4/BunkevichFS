@@ -1,7 +1,3 @@
-/*
- * bnkfs.h — общие определения BunkevichFS, доступные как ядру, так и userspace.
- * Включает IOCTL-команды и связанные с ними структуры.
- */
 #ifndef BNKFS_H
 #define BNKFS_H
 
@@ -9,46 +5,39 @@
 #include <linux/types.h>
 #include <linux/ioctl.h>
 #else
-#include <linux/types.h>  /* даёт согласованные с ядром __u32/__u64 */
+#include <linux/types.h>
 #include <sys/ioctl.h>
 #endif
 
-#define BNKFS_FS_NAME      "bnkfs"
-#define BNKFS_MAGIC        0x424E4B46u  /* "BNKF" */
-#define BNKFS_SECTOR_SIZE  512u
-#define BNKFS_NAME_MAX     64u
+#define BFS_NAME       "bnkfs"
+#define BFS_SIG        0x424E4B46u
+#define BFS_SECTOR     512u
+#define BFS_MAX_NAME   64u
 
-/* Метаинформация об одном файле (используется IOCTL GET_HASHES). */
-struct bnkfs_file_meta {
-	char  name[BNKFS_NAME_MAX]; /* имя файла */
-	__u32 hash;                 /* CRC32 содержимого файла */
-	__u32 start_sector;         /* первый сектор файла на диске */
-	__u32 sector_count;         /* сколько секторов занимает */
+struct bfs_meta {
+	char  name[BFS_MAX_NAME];
+	__u32 hash;
+	__u32 start_sector;
+	__u32 sector_count;
 	__u32 _pad;
 };
 
-/*
- * Запрос на получение метаинформации обо всех файлах.
- * entries указывает на буфер размером max_count элементов в userspace,
- * ядро записывает туда не более max_count записей, в count кладёт фактическое.
- */
-struct bnkfs_hashes_req {
+struct bfs_hashes {
 	__u32 max_count;
 	__u32 count;
-	__u64 entries; /* указатель на массив struct bnkfs_file_meta */
+	__u64 entries;
 };
 
-/* Запрос маппинга секторов для заданного файла. */
-struct bnkfs_mapping {
-	char  name[BNKFS_NAME_MAX]; /* in: имя файла */
-	__u32 start_sector;         /* out: первый сектор */
-	__u32 sector_count;         /* out: число секторов */
+struct bfs_map {
+	char  name[BFS_MAX_NAME];
+	__u32 start_sector;
+	__u32 sector_count;
 };
 
-#define BNKFS_IOC_MAGIC 'B'
-#define BNKFS_IOC_ZERO_ALL    _IO(BNKFS_IOC_MAGIC, 1)
-#define BNKFS_IOC_ERASE_FS    _IO(BNKFS_IOC_MAGIC, 2)
-#define BNKFS_IOC_GET_HASHES  _IOWR(BNKFS_IOC_MAGIC, 3, struct bnkfs_hashes_req)
-#define BNKFS_IOC_GET_MAPPING _IOWR(BNKFS_IOC_MAGIC, 4, struct bnkfs_mapping)
+#define BFS_IOC_MAG 'B'
+#define BFS_IOC_ZERO    _IO(BFS_IOC_MAG, 1)
+#define BFS_IOC_WIPE    _IO(BFS_IOC_MAG, 2)
+#define BFS_IOC_HASHES  _IOWR(BFS_IOC_MAG, 3, struct bfs_hashes)
+#define BFS_IOC_MAP     _IOWR(BFS_IOC_MAG, 4, struct bfs_map)
 
-#endif /* BNKFS_H */
+#endif

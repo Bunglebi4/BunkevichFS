@@ -1,9 +1,5 @@
-# Сборка ядерного модуля BunkevichFS.
-# По умолчанию строится против /lib/modules/$(uname -r)/build.
-# Для других ядер задавайте KDIR=<путь до build-дерева>.
-
-obj-m       += bnkfs.o
-bnkfs-y     := super.o inode.o file.o
+obj-m   += bnkfs.o
+bnkfs-y := mod.o disk.o node.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)

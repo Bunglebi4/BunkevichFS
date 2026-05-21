@@ -1,11 +1,3 @@
-/*
- * bnkfs_test.c — демонстрационная программа из задания.
- *
- * Обходит все файлы внутри переданного mountpoint, в каждый пишет
- * 64-битное случайное число и тут же читает его обратно. В конце —
- * сводка "N passed, M failed".
- */
-
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
@@ -19,13 +11,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-static int cmp_str(const void *a, const void *b)
+static int by_str(const void *a, const void *b)
 {
 	return strcmp(*(const char **)a, *(const char **)b);
 }
 
-/* Собираем список имён файлов вида file_* в каталоге. */
-static char **collect_files(const char *dir, size_t *out_n)
+static char **scan_dir(const char *dir, size_t *out_n)
 {
 	DIR *d = opendir(dir);
 	if (!d) { fprintf(stderr, "opendir(%s): %s\n", dir, strerror(errno)); return NULL; }
@@ -47,21 +38,20 @@ static char **collect_files(const char *dir, size_t *out_n)
 		arr[n++] = strdup(e->d_name);
 	}
 	closedir(d);
-	qsort(arr, n, sizeof(*arr), cmp_str);
+	qsort(arr, n, sizeof(*arr), by_str);
 	*out_n = n;
 	return arr;
 }
 
-/* Простой 64-битный ГПСЧ на базе xorshift, чтобы не таскать libstdc++. */
-static uint64_t rng_state;
-static void rng_seed(uint64_t s) { rng_state = s ? s : 0xdeadbeefULL; }
-static uint64_t rng_next(void)
+static uint64_t g_state;
+static void rng_init(uint64_t s) { g_state = s ? s : 0xdeadbeefULL; }
+static uint64_t rng_pull(void)
 {
-	uint64_t x = rng_state;
+	uint64_t x = g_state;
 	x ^= x << 13;
 	x ^= x >> 7;
 	x ^= x << 17;
-	rng_state = x;
+	g_state = x;
 	return x;
 }
 
@@ -74,57 +64,57 @@ int main(int argc, char **argv)
 	const char *mp = argv[1];
 
 	size_t n;
-	char **names = collect_files(mp, &n);
-	if (!names || n == 0) {
+	char **list = scan_dir(mp, &n);
+	if (!list || n == 0) {
 		fprintf(stderr, "no files found in %s\n", mp);
 		return 1;
 	}
 
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
-	rng_seed((uint64_t)ts.tv_sec ^ (uint64_t)ts.tv_nsec ^ (uint64_t)getpid());
+	rng_init((uint64_t)ts.tv_sec ^ (uint64_t)ts.tv_nsec ^ (uint64_t)getpid());
 
-	size_t passed = 0, failed = 0;
+	size_t good = 0, bad = 0;
 	char path[4096];
 
 	for (size_t i = 0; i < n; i++) {
-		snprintf(path, sizeof(path), "%s/%s", mp, names[i]);
+		snprintf(path, sizeof(path), "%s/%s", mp, list[i]);
 		int fd = open(path, O_RDWR);
 		if (fd < 0) {
 			fprintf(stderr, "%s: open: %s\n", path, strerror(errno));
-			failed++;
+			bad++;
 			continue;
 		}
-		uint64_t value = rng_next();
+		uint64_t value = rng_pull();
 		if (pwrite(fd, &value, sizeof(value), 0) != (ssize_t)sizeof(value)) {
 			fprintf(stderr, "%s: pwrite: %s\n", path, strerror(errno));
-			close(fd); failed++; continue;
+			close(fd); bad++; continue;
 		}
 		fsync(fd);
 
-		uint64_t back = 0;
-		if (pread(fd, &back, sizeof(back), 0) != (ssize_t)sizeof(back)) {
+		uint64_t echo = 0;
+		if (pread(fd, &echo, sizeof(echo), 0) != (ssize_t)sizeof(echo)) {
 			fprintf(stderr, "%s: pread: %s\n", path, strerror(errno));
-			close(fd); failed++; continue;
+			close(fd); bad++; continue;
 		}
 		close(fd);
 
-		if (back == value) {
+		if (echo == value) {
 			printf("%s: OK  (0x%016llx)\n",
-			       names[i], (unsigned long long)value);
-			passed++;
+			       list[i], (unsigned long long)value);
+			good++;
 		} else {
 			printf("%s: FAIL  wrote=0x%llx read=0x%llx\n",
-			       names[i],
+			       list[i],
 			       (unsigned long long)value,
-			       (unsigned long long)back);
-			failed++;
+			       (unsigned long long)echo);
+			bad++;
 		}
 	}
 
-	for (size_t i = 0; i < n; i++) free(names[i]);
-	free(names);
+	for (size_t i = 0; i < n; i++) free(list[i]);
+	free(list);
 
-	printf("%zu passed, %zu failed\n", passed, failed);
-	return failed ? 2 : 0;
+	printf("%zu passed, %zu failed\n", good, bad);
+	return bad ? 2 : 0;
 }
