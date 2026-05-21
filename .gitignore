@@ -1,0 +1,34 @@
+# Kernel build artefacts
+*.o
+*.o.*
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+*.symvers
+*.order
+.tmp_versions/
+.*.cmd
+modules.builtin
+modules.builtin.modinfo
+Module.markers
+Module.symvers
+modules.order
+
+# Userspace binaries
+user/bnkfs_cli
+user/bnkfs_test
+
+# Editor / OS junk
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Local test artefacts
+/tmp/
+*.img
+*.log

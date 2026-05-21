@@ -1,31 +1,13 @@
-# Сборка ядерного модуля и userspace-утилиты для BunkevichFS.
-#
-# Использование:
-#   make            — собрать модуль (bnkfs.ko) и userspace-утилиту (user_tool)
-#   make module     — только модуль
-#   make user       — только userspace-программу
-#   make clean      — почистить артефакты
+.PHONY: all kernel user clean
 
-obj-m := bnkfs.o
+all: kernel user
 
-KDIR ?= /lib/modules/$(shell uname -r)/build
-PWD  := $(shell pwd)
+kernel:
+	$(MAKE) -C kernel
 
-CXX      ?= g++
-CXXFLAGS ?= -O2 -Wall -Wextra -std=c++17
-
-.PHONY: all module user clean
-
-all: module user
-
-module:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
-
-user: user_tool
-
-user_tool: user_tool.cpp bnkfs_ioctl.h
-	$(CXX) $(CXXFLAGS) user_tool.cpp -o user_tool
+user:
+	$(MAKE) -C user
 
 clean:
-	-$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f user_tool
+	$(MAKE) -C kernel clean
+	$(MAKE) -C user clean

@@ -1,25 +1,24 @@
 /*
- * bnkfs_ioctl.h — общие определения IOCTL для ядерного модуля BunkevichFS
- * и userspace-утилиты. Заголовок инклюдится как из кода ядра, так и из C++.
+ * bnkfs.h — общие определения BunkevichFS, доступные как ядру, так и userspace.
+ * Включает IOCTL-команды и связанные с ними структуры.
  */
-#ifndef BNKFS_IOCTL_H
-#define BNKFS_IOCTL_H
+#ifndef BNKFS_H
+#define BNKFS_H
 
 #ifdef __KERNEL__
 #include <linux/types.h>
 #include <linux/ioctl.h>
 #else
-#include <linux/types.h> /* даёт __u32 / __u64, согласованные с ядром */
+#include <linux/types.h>  /* даёт согласованные с ядром __u32/__u64 */
 #include <sys/ioctl.h>
 #endif
 
-/* Магическое число для IOCTL команд нашей ФС. */
-#define BNKFS_IOC_MAGIC 'B'
+#define BNKFS_FS_NAME      "bnkfs"
+#define BNKFS_MAGIC        0x424E4B46u  /* "BNKF" */
+#define BNKFS_SECTOR_SIZE  512u
+#define BNKFS_NAME_MAX     64u
 
-/* Максимальная длина имени файла в структурах IOCTL (с запасом). */
-#define BNKFS_NAME_MAX 64
-
-/* Описание одного файла в ответе на BNKFS_IOC_GET_HASHES. */
+/* Метаинформация об одном файле (используется IOCTL GET_HASHES). */
 struct bnkfs_file_meta {
 	char  name[BNKFS_NAME_MAX]; /* имя файла */
 	__u32 hash;                 /* CRC32 содержимого файла */
@@ -39,20 +38,17 @@ struct bnkfs_hashes_req {
 	__u64 entries; /* указатель на массив struct bnkfs_file_meta */
 };
 
-/* Запрос маппинга секторов для заданного по имени файла. */
+/* Запрос маппинга секторов для заданного файла. */
 struct bnkfs_mapping {
 	char  name[BNKFS_NAME_MAX]; /* in: имя файла */
 	__u32 start_sector;         /* out: первый сектор */
 	__u32 sector_count;         /* out: число секторов */
 };
 
-/* Обнулить содержимое всех файлов. */
+#define BNKFS_IOC_MAGIC 'B'
 #define BNKFS_IOC_ZERO_ALL    _IO(BNKFS_IOC_MAGIC, 1)
-/* Стереть ФС (затереть оба суперблока, чтобы при следующем mount была ошибка). */
 #define BNKFS_IOC_ERASE_FS    _IO(BNKFS_IOC_MAGIC, 2)
-/* Получить список метаинформации (имена и хэши) всех файлов. */
 #define BNKFS_IOC_GET_HASHES  _IOWR(BNKFS_IOC_MAGIC, 3, struct bnkfs_hashes_req)
-/* Получить маппинг секторов для одного файла. */
 #define BNKFS_IOC_GET_MAPPING _IOWR(BNKFS_IOC_MAGIC, 4, struct bnkfs_mapping)
 
-#endif /* BNKFS_IOCTL_H */
+#endif /* BNKFS_H */
