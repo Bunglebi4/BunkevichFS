@@ -8,7 +8,7 @@
 
 obj-m := bnkfs.o
 
-KDIR ?= /home/1nflutorm/Downloads/Linux/linux-6.12.90
+KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
 
 CXX      ?= g++
