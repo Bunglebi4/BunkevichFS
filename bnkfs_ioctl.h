@@ -9,10 +9,8 @@
 #include <linux/types.h>
 #include <linux/ioctl.h>
 #else
-#include <stdint.h>
+#include <linux/types.h> /* даёт __u32 / __u64, согласованные с ядром */
 #include <sys/ioctl.h>
-typedef uint32_t __u32;
-typedef uint64_t __u64;
 #endif
 
 /* Магическое число для IOCTL команд нашей ФС. */
