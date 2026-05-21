@@ -1,4 +1,5 @@
 #include <linux/buffer_head.h>
+#include <linux/blkdev.h>
 #include <linux/crc32.h>
 #include <linux/fs.h>
 #include <linux/init.h>
