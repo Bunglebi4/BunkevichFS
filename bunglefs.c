@@ -658,7 +658,7 @@ static int bunglefs_fill_super(struct super_block *sb, struct fs_context *fc)
     }
     fsi->bdev = file_bdev(fsi->bdev_file);
 
-    rc = set_blocksize(fsi->bdev, BUNGLEFS_SECTOR_SIZE);
+    rc = set_blocksize(fsi->bdev_file, BUNGLEFS_SECTOR_SIZE);
     if (rc) {
         pr_err("bunglefs: set_blocksize: %d\n", rc);
         goto err_close;
