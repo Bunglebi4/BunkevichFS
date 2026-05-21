@@ -1,769 +1,877 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * BunkevichFS — учебная файловая система для ядра Linux 6.12.
+ *
+ * Особенности:
+ *  - Размещается поверх существующего блочного устройства.
+ *  - Содержит две копии суперблока: в секторе 0 и в секторе sb2_offset.
+ *  - Целостность суперблока контролируется CRC32 по всем полям, кроме самого хэша.
+ *  - При инициализации (первый mount) все файлы создаются заранее:
+ *    каждый файл занимает ровно max_file_sectors (M) последовательных секторов.
+ *  - Имена файлов формируются автоматически: "file_0000", "file_0001", ...
+ *  - Поддерживаются только чтение и запись содержимого файлов плюс несколько IOCTL.
+ *
+ * Параметры модуля:
+ *  - disk_name           — имя ожидаемого блочного устройства (для проверки при mount).
+ *  - sb1_offset          — смещение первой копии суперблока в секторах (обычно 0).
+ *  - sb2_offset          — смещение второй копии суперблока в секторах.
+ *  - max_name_len        — максимальная длина имени файла.
+ *  - max_file_sectors    — размер каждого файла в секторах (параметр M).
+ */
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/fs.h>
+#include <linux/fs_context.h>
 #include <linux/buffer_head.h>
 #include <linux/blkdev.h>
-#include <linux/crc32.h>
-#include <linux/fs.h>
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/miscdevice.h>
-#include <linux/module.h>
-#include <linux/mount.h>
-#include <linux/mutex.h>
-#include <linux/namei.h>
 #include <linux/slab.h>
-#include <linux/statfs.h>
 #include <linux/string.h>
+#include <linux/crc32.h>
 #include <linux/uaccess.h>
+#include <linux/statfs.h>
+#include <linux/pagemap.h>
+#include <linux/version.h>
 
 #include "bnkfs_ioctl.h"
 
-#define BNKFS_NAME "bnkfs"
-#define BNKFS_MAGIC 0x424e4b46U
-#define BNKFS_VERSION 1
-#define BNKFS_SECTOR_SIZE 512U
-#define BNKFS_SB(sb) ((struct bnkfs_sb_info *)((sb)->s_fs_info))
+#define BNKFS_MAGIC        0x424E4B46u /* "BNKF" */
+#define BNKFS_SECTOR_SIZE  512u
+#define BNKFS_BLOCK_SIZE   BNKFS_SECTOR_SIZE /* работаем секторами 512 байт */
+#define BNKFS_ROOT_INO     1u
+#define BNKFS_FILE_INO_BASE 2u /* первый файловый inode */
 
-struct bnkfs_disk_super {
-	__le32 magic;
-	__le32 version;
-	__le64 primary_sector;
-	__le64 backup_sector;
-	__le64 total_sectors;
-	__le64 data_start_sector;
-	__le32 file_count;
-	__le32 file_sectors;
-	__le32 max_name_len;
-	__le32 checksum;
-} __packed;
-
-struct bnkfs_file_entry {
-	u32 index;
-	u64 start_sector;
-	u32 sectors;
-	char name[BNKFS_IOCTL_NAME_MAX];
-	u32 hash;
-};
-
-struct bnkfs_sb_info {
-	struct super_block *sb;
-	struct bnkfs_disk_super dsb;
-	struct bnkfs_file_entry *files;
-	u32 file_count;
-	u32 file_sectors;
-	u32 max_name_len;
-	u64 primary_sector;
-	u64 backup_sector;
-	struct mutex io_lock;
-};
+/* ------------------------------------------------------------- */
+/*                       Параметры модуля                          */
+/* ------------------------------------------------------------- */
 
 static char *disk_name = "";
 module_param(disk_name, charp, 0444);
-MODULE_PARM_DESC(disk_name, "Base block device name or /dev path");
+MODULE_PARM_DESC(disk_name, "Имя блочного устройства, на котором ожидаем нашу ФС");
 
-static ulong sb_primary_sector;
-module_param(sb_primary_sector, ulong, 0444);
-MODULE_PARM_DESC(sb_primary_sector, "Primary superblock sector offset");
+static unsigned int sb1_offset = 0;
+module_param(sb1_offset, uint, 0444);
+MODULE_PARM_DESC(sb1_offset, "Смещение первой копии суперблока в секторах");
 
-static ulong sb_backup_sector = 8;
-module_param(sb_backup_sector, ulong, 0444);
-MODULE_PARM_DESC(sb_backup_sector, "Backup superblock sector offset");
+static unsigned int sb2_offset = 16;
+module_param(sb2_offset, uint, 0444);
+MODULE_PARM_DESC(sb2_offset, "Смещение второй копии суперблока в секторах");
 
-static uint max_filename_len = 32;
-module_param(max_filename_len, uint, 0444);
-MODULE_PARM_DESC(max_filename_len, "Maximum file name length");
+static unsigned int max_name_len = 32;
+module_param(max_name_len, uint, 0444);
+MODULE_PARM_DESC(max_name_len, "Максимальная длина имени файла");
 
-static uint max_file_sectors = 1;
+static unsigned int max_file_sectors = 4;
 module_param(max_file_sectors, uint, 0444);
-MODULE_PARM_DESC(max_file_sectors, "File size in sectors (1..M)");
+MODULE_PARM_DESC(max_file_sectors, "Размер каждого файла в секторах (M)");
 
-static DEFINE_MUTEX(bnkfs_ctl_lock);
-static struct bnkfs_sb_info *bnkfs_active_sbi;
+/* ------------------------------------------------------------- */
+/*                       Дисковые структуры                        */
+/* ------------------------------------------------------------- */
 
-static u32 bnkfs_super_checksum(const struct bnkfs_disk_super *src)
+/*
+ * Дисковый суперблок. Размещается в одном секторе, поэтому ограничен 512 байт.
+ * Все поля little-endian — храним «как есть» (для учебного модуля этого достаточно).
+ */
+struct bnkfs_disk_sb {
+	__u32 magic;             /* BNKFS_MAGIC */
+	__u32 version;           /* версия формата (1) */
+	__u32 total_sectors;     /* общее число секторов на устройстве */
+	__u32 sb1_offset;        /* положение первой копии суперблока */
+	__u32 sb2_offset;        /* положение второй копии суперблока */
+	__u32 data_start_sector; /* первый сектор с данными файлов */
+	__u32 file_count;        /* число файлов в ФС */
+	__u32 file_sectors;      /* сколько секторов занимает каждый файл (M) */
+	__u32 max_name_len;      /* максимальная длина имени файла */
+	__u32 name_digits;       /* сколько цифр используется в имени файла */
+	__u32 reserved[21];      /* выравнивание и место под будущее */
+	__u32 hash;              /* CRC32 по всем полям выше */
+} __packed;
+
+/* Считаем CRC32 по структуре, кроме поля hash в самом конце. */
+static __u32 bnkfs_sb_calc_hash(const struct bnkfs_disk_sb *dsb)
 {
-	struct bnkfs_disk_super tmp = *src;
-
-	tmp.checksum = 0;
-	return crc32(0, (const u8 *)&tmp, sizeof(tmp));
+	size_t len = offsetof(struct bnkfs_disk_sb, hash);
+	return crc32(0, (const u8 *)dsb, len);
 }
 
-static bool bnkfs_super_valid(const struct bnkfs_disk_super *dsb)
-{
-	u32 stored = le32_to_cpu(dsb->checksum);
+/* ------------------------------------------------------------- */
+/*                    In-memory информация о ФС                    */
+/* ------------------------------------------------------------- */
 
-	if (le32_to_cpu(dsb->magic) != BNKFS_MAGIC)
-		return false;
-	if (le32_to_cpu(dsb->version) != BNKFS_VERSION)
-		return false;
-	return stored == bnkfs_super_checksum(dsb);
-}
-
-static int bnkfs_read_raw_sector(struct super_block *sb, u64 sector, u8 *out)
-{
-	struct buffer_head *bh;
-
-	bh = sb_bread(sb, sector);
-	if (!bh)
-		return -EIO;
-	memcpy(out, bh->b_data, BNKFS_SECTOR_SIZE);
-	brelse(bh);
-	return 0;
-}
-
-static int bnkfs_write_raw_sector(struct super_block *sb, u64 sector, const u8 *in)
-{
-	struct buffer_head *bh;
-
-	bh = sb_bread(sb, sector);
-	if (!bh)
-		return -EIO;
-	memcpy(bh->b_data, in, BNKFS_SECTOR_SIZE);
-	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
-	if (buffer_write_io_error(bh)) {
-		brelse(bh);
-		return -EIO;
-	}
-	brelse(bh);
-	return 0;
-}
-
-static int bnkfs_read_disk_super(struct super_block *sb, u64 sector,
-				 struct bnkfs_disk_super *dsb)
-{
-	u8 tmp[BNKFS_SECTOR_SIZE];
-	int ret;
-
-	ret = bnkfs_read_raw_sector(sb, sector, tmp);
-	if (ret)
-		return ret;
-	memcpy(dsb, tmp, sizeof(*dsb));
-	return 0;
-}
-
-static int bnkfs_write_disk_super(struct super_block *sb,
-				  const struct bnkfs_sb_info *sbi)
-{
-	u8 raw[BNKFS_SECTOR_SIZE];
-	struct bnkfs_disk_super dsb;
-	int ret;
-
-	memset(raw, 0, sizeof(raw));
-	dsb = sbi->dsb;
-	dsb.checksum = cpu_to_le32(bnkfs_super_checksum(&dsb));
-	memcpy(raw, &dsb, sizeof(dsb));
-
-	ret = bnkfs_write_raw_sector(sb, sbi->primary_sector, raw);
-	if (ret)
-		return ret;
-	return bnkfs_write_raw_sector(sb, sbi->backup_sector, raw);
-}
-
-static int bnkfs_recompute_hash(struct super_block *sb, struct bnkfs_file_entry *fe)
-{
-	u32 crc = 0;
-	u32 i;
-	int ret;
-	u8 tmp[BNKFS_SECTOR_SIZE];
-
-	for (i = 0; i < fe->sectors; i++) {
-		ret = bnkfs_read_raw_sector(sb, fe->start_sector + i, tmp);
-		if (ret)
-			return ret;
-		crc = crc32(crc, tmp, BNKFS_SECTOR_SIZE);
-	}
-	fe->hash = crc;
-	return 0;
-}
-
-static int bnkfs_zero_file(struct super_block *sb, struct bnkfs_file_entry *fe)
-{
-	u8 zeros[BNKFS_SECTOR_SIZE];
-	u32 i;
-	int ret;
-
-	memset(zeros, 0, sizeof(zeros));
-	for (i = 0; i < fe->sectors; i++) {
-		ret = bnkfs_write_raw_sector(sb, fe->start_sector + i, zeros);
-		if (ret)
-			return ret;
-	}
-	return bnkfs_recompute_hash(sb, fe);
-}
-
-static struct bnkfs_file_entry *bnkfs_find_file(struct bnkfs_sb_info *sbi,
-						const char *name, size_t len)
-{
-	u32 i;
-
-	for (i = 0; i < sbi->file_count; i++) {
-		if (strlen(sbi->files[i].name) == len &&
-		    !strncmp(sbi->files[i].name, name, len))
-			return &sbi->files[i];
-	}
-	return NULL;
-}
-
-static int bnkfs_fill_entries(struct super_block *sb, struct bnkfs_sb_info *sbi,
-			      bool zero_data)
-{
-	u32 i;
-	int ret;
-	u32 width;
-	u64 data_start = le64_to_cpu(sbi->dsb.data_start_sector);
-
-	width = max(1U, min_t(u32, 9, sbi->max_name_len - 4));
-
-	for (i = 0; i < sbi->file_count; i++) {
-		struct bnkfs_file_entry *fe = &sbi->files[i];
-
-		fe->index = i;
-		fe->start_sector = data_start + (u64)i * sbi->file_sectors;
-		fe->sectors = sbi->file_sectors;
-		snprintf(fe->name, sizeof(fe->name), "f%0*u", width, i);
-
-		if (zero_data)
-			ret = bnkfs_zero_file(sb, fe);
-		else
-			ret = bnkfs_recompute_hash(sb, fe);
-		if (ret)
-			return ret;
-	}
-	return 0;
-}
-
-static ssize_t bnkfs_file_read(struct file *filp, char __user *buf,
-			       size_t len, loff_t *ppos)
-{
-	struct inode *inode = file_inode(filp);
-	struct super_block *sb = inode->i_sb;
-	struct bnkfs_file_entry *fe = inode->i_private;
-	loff_t size = i_size_read(inode);
-	size_t done = 0;
-	int ret = 0;
-
-	if (!fe)
-		return -EIO;
-	if (*ppos >= size)
-		return 0;
-	if (len > size - *ppos)
-		len = size - *ppos;
-
-	mutex_lock(&BNKFS_SB(sb)->io_lock);
-	while (done < len) {
-		u64 file_pos = *ppos + done;
-		u32 sec_idx = div_u64(file_pos, BNKFS_SECTOR_SIZE);
-		u32 off = file_pos % BNKFS_SECTOR_SIZE;
-		size_t chunk = min_t(size_t, BNKFS_SECTOR_SIZE - off, len - done);
-		struct buffer_head *bh;
-
-		bh = sb_bread(sb, fe->start_sector + sec_idx);
-		if (!bh) {
-			ret = -EIO;
-			break;
-		}
-		if (copy_to_user(buf + done, bh->b_data + off, chunk)) {
-			brelse(bh);
-			ret = -EFAULT;
-			break;
-		}
-		brelse(bh);
-		done += chunk;
-	}
-	mutex_unlock(&BNKFS_SB(sb)->io_lock);
-
-	if (ret && !done)
-		return ret;
-	*ppos += done;
-	return done;
-}
-
-static ssize_t bnkfs_file_write(struct file *filp, const char __user *buf,
-				size_t len, loff_t *ppos)
-{
-	struct inode *inode = file_inode(filp);
-	struct super_block *sb = inode->i_sb;
-	struct bnkfs_file_entry *fe = inode->i_private;
-	loff_t size = i_size_read(inode);
-	size_t done = 0;
-	int ret = 0;
-
-	if (!fe)
-		return -EIO;
-	if (*ppos >= size)
-		return -ENOSPC;
-	if (len > size - *ppos)
-		len = size - *ppos;
-
-	mutex_lock(&BNKFS_SB(sb)->io_lock);
-	while (done < len) {
-		u64 file_pos = *ppos + done;
-		u32 sec_idx = div_u64(file_pos, BNKFS_SECTOR_SIZE);
-		u32 off = file_pos % BNKFS_SECTOR_SIZE;
-		size_t chunk = min_t(size_t, BNKFS_SECTOR_SIZE - off, len - done);
-		struct buffer_head *bh;
-
-		bh = sb_bread(sb, fe->start_sector + sec_idx);
-		if (!bh) {
-			ret = -EIO;
-			break;
-		}
-		if (copy_from_user(bh->b_data + off, buf + done, chunk)) {
-			brelse(bh);
-			ret = -EFAULT;
-			break;
-		}
-		mark_buffer_dirty(bh);
-		sync_dirty_buffer(bh);
-		if (buffer_write_io_error(bh)) {
-			brelse(bh);
-			ret = -EIO;
-			break;
-		}
-		brelse(bh);
-		done += chunk;
-	}
-	if (!ret)
-		ret = bnkfs_recompute_hash(sb, fe);
-	mutex_unlock(&BNKFS_SB(sb)->io_lock);
-
-	if (ret && !done)
-		return ret;
-	*ppos += done;
-	inode_set_mtime_to_ts(inode, current_time(inode));
-	inode_set_ctime_current(inode);
-	mark_inode_dirty(inode);
-	return done;
-}
-
-static const struct file_operations bnkfs_file_ops = {
-	.owner = THIS_MODULE,
-	.read = bnkfs_file_read,
-	.write = bnkfs_file_write,
-	.llseek = generic_file_llseek,
+struct bnkfs_sb_info {
+	__u32 sb1_offset;
+	__u32 sb2_offset;
+	__u32 data_start_sector;
+	__u32 file_count;
+	__u32 file_sectors;
+	__u32 max_name_len;
+	__u32 name_digits;
+	__u32 total_sectors;
 };
 
-static int bnkfs_iterate(struct file *file, struct dir_context *ctx)
+/* По индексу файла возвращаем стартовый сектор. */
+static inline sector_t bnkfs_file_start_sector(struct bnkfs_sb_info *sbi, unsigned int idx)
+{
+	return (sector_t)sbi->data_start_sector + (sector_t)idx * sbi->file_sectors;
+}
+
+/* Формирует строковое имя файла по индексу (file_XXXX). */
+static void bnkfs_make_name(struct bnkfs_sb_info *sbi, unsigned int idx, char *out, size_t outsz)
+{
+	snprintf(out, outsz, "file_%0*u", sbi->name_digits, idx);
+}
+
+/* Пытается распарсить имя "file_NNNN" и вернуть индекс или -1. */
+static int bnkfs_parse_name(struct bnkfs_sb_info *sbi, const char *name, size_t len)
+{
+	char buf[BNKFS_NAME_MAX];
+	unsigned int idx;
+	char expected[BNKFS_NAME_MAX];
+
+	if (len >= sizeof(buf))
+		return -1;
+	memcpy(buf, name, len);
+	buf[len] = '\0';
+
+	if (sscanf(buf, "file_%u", &idx) != 1)
+		return -1;
+	if (idx >= sbi->file_count)
+		return -1;
+	bnkfs_make_name(sbi, idx, expected, sizeof(expected));
+	if (strcmp(buf, expected) != 0)
+		return -1;
+	return (int)idx;
+}
+
+/* ------------------------------------------------------------- */
+/*                  Forward declarations                           */
+/* ------------------------------------------------------------- */
+
+static const struct super_operations bnkfs_sops;
+static const struct inode_operations bnkfs_dir_iops;
+static const struct file_operations  bnkfs_dir_fops;
+static const struct inode_operations bnkfs_file_iops;
+static const struct file_operations  bnkfs_file_fops;
+
+/* ------------------------------------------------------------- */
+/*                     Операции с суперблоком                      */
+/* ------------------------------------------------------------- */
+
+/* Записать суперблок в указанный сектор (через буферный кэш). */
+static int bnkfs_write_sb_copy(struct super_block *sb, sector_t where,
+			       const struct bnkfs_disk_sb *dsb)
+{
+	struct buffer_head *bh = sb_bread(sb, where);
+	if (!bh)
+		return -EIO;
+	lock_buffer(bh);
+	memset(bh->b_data, 0, sb->s_blocksize);
+	memcpy(bh->b_data, dsb, sizeof(*dsb));
+	set_buffer_uptodate(bh);
+	mark_buffer_dirty(bh);
+	unlock_buffer(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+	return 0;
+}
+
+/* Прочитать суперблок из указанного сектора и проверить хэш. */
+static int bnkfs_read_sb_copy(struct super_block *sb, sector_t where,
+			      struct bnkfs_disk_sb *out)
+{
+	struct buffer_head *bh = sb_bread(sb, where);
+	__u32 expected;
+
+	if (!bh)
+		return -EIO;
+	memcpy(out, bh->b_data, sizeof(*out));
+	brelse(bh);
+
+	if (out->magic != BNKFS_MAGIC)
+		return -EINVAL;
+	expected = bnkfs_sb_calc_hash(out);
+	if (expected != out->hash)
+		return -EILSEQ; /* хэш не совпал → данные повреждены */
+	return 0;
+}
+
+/*
+ * Создать ФС на устройстве с нуля: расставить две копии суперблока и обнулить
+ * сектора всех файлов. Вызывается, если ни одна копия SB не прочиталась корректно.
+ */
+static int bnkfs_format_device(struct super_block *sb, struct bnkfs_sb_info *sbi)
+{
+	struct bnkfs_disk_sb dsb;
+	unsigned int i;
+	int err;
+
+	pr_info("bnkfs: форматирую устройство (file_count=%u, file_sectors=%u)\n",
+		sbi->file_count, sbi->file_sectors);
+
+	memset(&dsb, 0, sizeof(dsb));
+	dsb.magic             = BNKFS_MAGIC;
+	dsb.version           = 1;
+	dsb.total_sectors     = sbi->total_sectors;
+	dsb.sb1_offset        = sbi->sb1_offset;
+	dsb.sb2_offset        = sbi->sb2_offset;
+	dsb.data_start_sector = sbi->data_start_sector;
+	dsb.file_count        = sbi->file_count;
+	dsb.file_sectors      = sbi->file_sectors;
+	dsb.max_name_len      = sbi->max_name_len;
+	dsb.name_digits       = sbi->name_digits;
+	dsb.hash              = bnkfs_sb_calc_hash(&dsb);
+
+	err = bnkfs_write_sb_copy(sb, sbi->sb1_offset, &dsb);
+	if (err)
+		return err;
+	err = bnkfs_write_sb_copy(sb, sbi->sb2_offset, &dsb);
+	if (err)
+		return err;
+
+	/* Обнуляем сектора всех файлов, чтобы их содержимое было предсказуемо. */
+	for (i = 0; i < sbi->file_count * sbi->file_sectors; i++) {
+		sector_t s = sbi->data_start_sector + i;
+		struct buffer_head *bh = sb_bread(sb, s);
+		if (!bh)
+			return -EIO;
+		lock_buffer(bh);
+		memset(bh->b_data, 0, sb->s_blocksize);
+		set_buffer_uptodate(bh);
+		mark_buffer_dirty(bh);
+		unlock_buffer(bh);
+		brelse(bh);
+	}
+	sync_blockdev(sb->s_bdev);
+	return 0;
+}
+
+/*
+ * Прочитать и провалидировать суперблок: сначала пробуем основной, при ошибке —
+ * запасной. Если ни одно из значений нечитаемо или хэш повреждён — форматируем.
+ */
+static int bnkfs_load_or_format(struct super_block *sb, struct bnkfs_sb_info *sbi)
+{
+	struct bnkfs_disk_sb dsb;
+	int err1, err2;
+
+	err1 = bnkfs_read_sb_copy(sb, sbi->sb1_offset, &dsb);
+	if (err1 == 0)
+		goto loaded;
+
+	pr_warn("bnkfs: основной суперблок повреждён (err=%d), пробую копию\n", err1);
+	err2 = bnkfs_read_sb_copy(sb, sbi->sb2_offset, &dsb);
+	if (err2 == 0) {
+		/* Восстановим основной из копии. */
+		pr_info("bnkfs: восстанавливаю основной суперблок из копии\n");
+		bnkfs_write_sb_copy(sb, sbi->sb1_offset, &dsb);
+		goto loaded;
+	}
+
+	pr_warn("bnkfs: обе копии суперблока невалидны (err1=%d err2=%d), форматирую\n",
+		err1, err2);
+	return bnkfs_format_device(sb, sbi);
+
+loaded:
+	/* Сверяем параметры in-memory с сохранёнными. Если расходятся — это
+	 * ФС с другими параметрами, форматируем заново под новые. */
+	if (dsb.file_count    != sbi->file_count   ||
+	    dsb.file_sectors  != sbi->file_sectors ||
+	    dsb.sb2_offset    != sbi->sb2_offset) {
+		pr_info("bnkfs: параметры ФС изменились, переформатирую\n");
+		return bnkfs_format_device(sb, sbi);
+	}
+	return 0;
+}
+
+/* ------------------------------------------------------------- */
+/*                  Чтение/запись содержимого файлов               */
+/* ------------------------------------------------------------- */
+
+/* Универсальный путь read: копируем из секторов в userspace через sb_bread. */
+static ssize_t bnkfs_file_read(struct file *file, char __user *buf,
+			       size_t len, loff_t *ppos)
 {
 	struct inode *inode = file_inode(file);
-	struct bnkfs_sb_info *sbi = BNKFS_SB(inode->i_sb);
-	u32 i;
+	struct super_block *sb = inode->i_sb;
+	struct bnkfs_sb_info *sbi = sb->s_fs_info;
+	unsigned int idx = (unsigned int)(inode->i_ino - BNKFS_FILE_INO_BASE);
+	loff_t pos = *ppos;
+	loff_t size = inode->i_size;
+	size_t copied = 0;
+	sector_t base;
+
+	if (pos < 0)
+		return -EINVAL;
+	if (pos >= size)
+		return 0;
+	if (pos + len > size)
+		len = size - pos;
+
+	base = bnkfs_file_start_sector(sbi, idx);
+
+	while (copied < len) {
+		u64 cur = (u64)pos + copied;
+		sector_t sec = base + (sector_t)(cur / BNKFS_SECTOR_SIZE);
+		unsigned int off = (unsigned int)(cur % BNKFS_SECTOR_SIZE);
+		unsigned int to_copy = min_t(size_t, BNKFS_SECTOR_SIZE - off, len - copied);
+		struct buffer_head *bh = sb_bread(sb, sec);
+
+		if (!bh)
+			return -EIO;
+		if (copy_to_user(buf + copied, bh->b_data + off, to_copy)) {
+			brelse(bh);
+			return -EFAULT;
+		}
+		brelse(bh);
+		copied += to_copy;
+	}
+	*ppos = pos + copied;
+	return copied;
+}
+
+/* Запись: тоже посекторно, через sb_bread + mark_buffer_dirty. */
+static ssize_t bnkfs_file_write(struct file *file, const char __user *buf,
+				size_t len, loff_t *ppos)
+{
+	struct inode *inode = file_inode(file);
+	struct super_block *sb = inode->i_sb;
+	struct bnkfs_sb_info *sbi = sb->s_fs_info;
+	unsigned int idx = (unsigned int)(inode->i_ino - BNKFS_FILE_INO_BASE);
+	loff_t pos = *ppos;
+	loff_t size = inode->i_size;
+	size_t written = 0;
+	sector_t base;
+
+	if (pos < 0)
+		return -EINVAL;
+	if (pos >= size)
+		return -ENOSPC; /* файлы фиксированного размера, расти не могут */
+	if (pos + len > size)
+		len = size - pos;
+
+	base = bnkfs_file_start_sector(sbi, idx);
+
+	while (written < len) {
+		u64 cur = (u64)pos + written;
+		sector_t sec = base + (sector_t)(cur / BNKFS_SECTOR_SIZE);
+		unsigned int off = (unsigned int)(cur % BNKFS_SECTOR_SIZE);
+		unsigned int to_copy = min_t(size_t, BNKFS_SECTOR_SIZE - off, len - written);
+		struct buffer_head *bh = sb_bread(sb, sec);
+
+		if (!bh)
+			return -EIO;
+		lock_buffer(bh);
+		if (copy_from_user(bh->b_data + off, buf + written, to_copy)) {
+			unlock_buffer(bh);
+			brelse(bh);
+			return -EFAULT;
+		}
+		set_buffer_uptodate(bh);
+		mark_buffer_dirty(bh);
+		unlock_buffer(bh);
+		brelse(bh);
+		written += to_copy;
+	}
+	*ppos = pos + written;
+	return written;
+}
+
+/* Принудительный сброс грязных буферов на устройство. */
+static int bnkfs_file_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+{
+	struct super_block *sb = file_inode(file)->i_sb;
+	sync_blockdev(sb->s_bdev);
+	return 0;
+}
+
+/* ------------------------------------------------------------- */
+/*                            IOCTL                                */
+/* ------------------------------------------------------------- */
+
+/* Обнулить все сектора всех файлов. */
+static long bnkfs_ioc_zero_all(struct super_block *sb)
+{
+	struct bnkfs_sb_info *sbi = sb->s_fs_info;
+	unsigned int i;
+	unsigned int total = sbi->file_count * sbi->file_sectors;
+
+	for (i = 0; i < total; i++) {
+		sector_t s = sbi->data_start_sector + i;
+		struct buffer_head *bh = sb_bread(sb, s);
+		if (!bh)
+			return -EIO;
+		lock_buffer(bh);
+		memset(bh->b_data, 0, sb->s_blocksize);
+		set_buffer_uptodate(bh);
+		mark_buffer_dirty(bh);
+		unlock_buffer(bh);
+		brelse(bh);
+	}
+	sync_blockdev(sb->s_bdev);
+	return 0;
+}
+
+/* Стереть ФС — затереть оба суперблока (магическое поле и хэш). */
+static long bnkfs_ioc_erase_fs(struct super_block *sb)
+{
+	struct bnkfs_sb_info *sbi = sb->s_fs_info;
+	sector_t copies[2] = { sbi->sb1_offset, sbi->sb2_offset };
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		struct buffer_head *bh = sb_bread(sb, copies[i]);
+		if (!bh)
+			return -EIO;
+		lock_buffer(bh);
+		memset(bh->b_data, 0, sb->s_blocksize);
+		set_buffer_uptodate(bh);
+		mark_buffer_dirty(bh);
+		unlock_buffer(bh);
+		sync_dirty_buffer(bh);
+		brelse(bh);
+	}
+	sync_blockdev(sb->s_bdev);
+	pr_info("bnkfs: ФС стёрта (обе копии SB обнулены)\n");
+	return 0;
+}
+
+/* Посчитать CRC32 по всему содержимому файла. */
+static int bnkfs_file_hash(struct super_block *sb, unsigned int idx, __u32 *out_hash)
+{
+	struct bnkfs_sb_info *sbi = sb->s_fs_info;
+	sector_t base = bnkfs_file_start_sector(sbi, idx);
+	unsigned int i;
+	__u32 h = 0;
+
+	for (i = 0; i < sbi->file_sectors; i++) {
+		struct buffer_head *bh = sb_bread(sb, base + i);
+		if (!bh)
+			return -EIO;
+		h = crc32(h, bh->b_data, BNKFS_SECTOR_SIZE);
+		brelse(bh);
+	}
+	*out_hash = h;
+	return 0;
+}
+
+/* Вернуть метаинформацию обо всех файлах. */
+static long bnkfs_ioc_get_hashes(struct super_block *sb, void __user *argp)
+{
+	struct bnkfs_sb_info *sbi = sb->s_fs_info;
+	struct bnkfs_hashes_req req;
+	struct bnkfs_file_meta *entries;
+	unsigned int i, to_write;
+	long ret = 0;
+
+	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+
+	to_write = min_t(unsigned int, req.max_count, sbi->file_count);
+	entries = kzalloc(sizeof(*entries) * to_write, GFP_KERNEL);
+	if (!entries && to_write)
+		return -ENOMEM;
+
+	for (i = 0; i < to_write; i++) {
+		bnkfs_make_name(sbi, i, entries[i].name, sizeof(entries[i].name));
+		entries[i].start_sector = bnkfs_file_start_sector(sbi, i);
+		entries[i].sector_count = sbi->file_sectors;
+		ret = bnkfs_file_hash(sb, i, &entries[i].hash);
+		if (ret)
+			goto out;
+	}
+
+	if (to_write && copy_to_user((void __user *)(uintptr_t)req.entries,
+				     entries, sizeof(*entries) * to_write)) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+	req.count = sbi->file_count; /* реальное число файлов в ФС */
+	if (copy_to_user(argp, &req, sizeof(req)))
+		ret = -EFAULT;
+
+out:
+	kfree(entries);
+	return ret;
+}
+
+/* Вернуть маппинг секторов для заданного по имени файла. */
+static long bnkfs_ioc_get_mapping(struct super_block *sb, void __user *argp)
+{
+	struct bnkfs_sb_info *sbi = sb->s_fs_info;
+	struct bnkfs_mapping req;
+	int idx;
+
+	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+	req.name[BNKFS_NAME_MAX - 1] = '\0';
+
+	idx = bnkfs_parse_name(sbi, req.name, strnlen(req.name, BNKFS_NAME_MAX));
+	if (idx < 0)
+		return -ENOENT;
+
+	req.start_sector = bnkfs_file_start_sector(sbi, idx);
+	req.sector_count = sbi->file_sectors;
+
+	if (copy_to_user(argp, &req, sizeof(req)))
+		return -EFAULT;
+	return 0;
+}
+
+/* Единый диспетчер IOCTL, доступный на любом файле и на корневой директории. */
+static long bnkfs_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct super_block *sb = file_inode(file)->i_sb;
+	void __user *argp = (void __user *)arg;
+
+	switch (cmd) {
+	case BNKFS_IOC_ZERO_ALL:
+		return bnkfs_ioc_zero_all(sb);
+	case BNKFS_IOC_ERASE_FS:
+		return bnkfs_ioc_erase_fs(sb);
+	case BNKFS_IOC_GET_HASHES:
+		return bnkfs_ioc_get_hashes(sb, argp);
+	case BNKFS_IOC_GET_MAPPING:
+		return bnkfs_ioc_get_mapping(sb, argp);
+	default:
+		return -ENOTTY;
+	}
+}
+
+/* ------------------------------------------------------------- */
+/*                      Директория и lookup                        */
+/* ------------------------------------------------------------- */
+
+/* iterate_shared: эмитим виртуальные записи file_0000 ... file_NNNN. */
+static int bnkfs_iterate(struct file *file, struct dir_context *ctx)
+{
+	struct super_block *sb = file_inode(file)->i_sb;
+	struct bnkfs_sb_info *sbi = sb->s_fs_info;
+	char name[BNKFS_NAME_MAX];
 
 	if (!dir_emit_dots(file, ctx))
 		return 0;
 
-	i = ctx->pos - 2;
-	while (i < sbi->file_count) {
-		struct bnkfs_file_entry *fe = &sbi->files[i];
-
-		if (!dir_emit(ctx, fe->name, strlen(fe->name), fe->index + 10, DT_REG))
+	while (ctx->pos >= 2 && (ctx->pos - 2) < sbi->file_count) {
+		unsigned int idx = (unsigned int)(ctx->pos - 2);
+		bnkfs_make_name(sbi, idx, name, sizeof(name));
+		if (!dir_emit(ctx, name, strlen(name),
+			      BNKFS_FILE_INO_BASE + idx, DT_REG))
 			return 0;
 		ctx->pos++;
-		i++;
 	}
 	return 0;
 }
 
+static struct inode *bnkfs_get_file_inode(struct super_block *sb, unsigned int idx);
+
+/* Lookup в корне: парсим имя как file_NNNN и создаём inode. */
 static struct dentry *bnkfs_lookup(struct inode *dir, struct dentry *dentry,
 				   unsigned int flags)
 {
-	struct bnkfs_sb_info *sbi = BNKFS_SB(dir->i_sb);
-	struct bnkfs_file_entry *fe;
+	struct super_block *sb = dir->i_sb;
+	struct bnkfs_sb_info *sbi = sb->s_fs_info;
+	int idx;
 	struct inode *inode = NULL;
 
-	(void)flags;
+	if (dentry->d_name.len > sbi->max_name_len)
+		return ERR_PTR(-ENAMETOOLONG);
 
-	fe = bnkfs_find_file(sbi, dentry->d_name.name, dentry->d_name.len);
-	if (fe) {
-		inode = new_inode(dir->i_sb);
-		if (!inode)
-			return ERR_PTR(-ENOMEM);
-		inode->i_ino = fe->index + 10;
-		inode_init_owner(&nop_mnt_idmap, inode, dir, S_IFREG | 0644);
-		i_size_write(inode, (loff_t)fe->sectors * BNKFS_SECTOR_SIZE);
-		inode->i_fop = &bnkfs_file_ops;
-		inode->i_private = fe;
-	}
-	d_add(dentry, inode);
-	return NULL;
+	idx = bnkfs_parse_name(sbi, dentry->d_name.name, dentry->d_name.len);
+	if (idx >= 0)
+		inode = bnkfs_get_file_inode(sb, (unsigned int)idx);
+
+	return d_splice_alias(inode, dentry);
 }
 
-static const struct inode_operations bnkfs_dir_inode_ops = {
+static const struct file_operations bnkfs_dir_fops = {
+	.owner          = THIS_MODULE,
+	.read           = generic_read_dir,
+	.iterate_shared = bnkfs_iterate,
+	.llseek         = generic_file_llseek,
+	.unlocked_ioctl = bnkfs_unlocked_ioctl,
+};
+
+static const struct inode_operations bnkfs_dir_iops = {
 	.lookup = bnkfs_lookup,
 };
 
-static const struct file_operations bnkfs_dir_ops = {
-	.owner = THIS_MODULE,
-	.iterate_shared = bnkfs_iterate,
-	.llseek = generic_file_llseek,
+/* ------------------------------------------------------------- */
+/*                     Операции с файлами                          */
+/* ------------------------------------------------------------- */
+
+static const struct file_operations bnkfs_file_fops = {
+	.owner          = THIS_MODULE,
+	.read           = bnkfs_file_read,
+	.write          = bnkfs_file_write,
+	.llseek         = generic_file_llseek,
+	.fsync          = bnkfs_file_fsync,
+	.unlocked_ioctl = bnkfs_unlocked_ioctl,
 };
 
-static int bnkfs_statfs(struct dentry *dentry, struct kstatfs *buf)
-{
-	struct super_block *sb = dentry->d_sb;
-	struct bnkfs_sb_info *sbi = BNKFS_SB(sb);
-	u64 total = le64_to_cpu(sbi->dsb.total_sectors);
+static const struct inode_operations bnkfs_file_iops = {
+	.setattr = simple_setattr,
+	.getattr = simple_getattr,
+};
 
-	buf->f_type = BNKFS_MAGIC;
-	buf->f_bsize = BNKFS_SECTOR_SIZE;
-	buf->f_blocks = total;
-	buf->f_bfree = 0;
-	buf->f_bavail = 0;
-	buf->f_files = sbi->file_count + 1;
-	buf->f_ffree = 0;
+/* Создать (или получить из кэша) inode для файла с индексом idx. */
+static struct inode *bnkfs_get_file_inode(struct super_block *sb, unsigned int idx)
+{
+	struct bnkfs_sb_info *sbi = sb->s_fs_info;
+	unsigned long ino = BNKFS_FILE_INO_BASE + idx;
+	struct inode *inode = iget_locked(sb, ino);
+
+	if (!inode)
+		return NULL;
+	if (!(inode->i_state & I_NEW))
+		return inode; /* уже инициализирован ранее */
+
+	inode->i_mode = S_IFREG | 0644;
+	inode->i_uid  = GLOBAL_ROOT_UID;
+	inode->i_gid  = GLOBAL_ROOT_GID;
+	inode->i_size = (loff_t)sbi->file_sectors * BNKFS_SECTOR_SIZE;
+	inode_set_atime_to_ts(inode, current_time(inode));
+	inode_set_mtime_to_ts(inode, current_time(inode));
+	inode_set_ctime_current(inode);
+	inode->i_op = &bnkfs_file_iops;
+	inode->i_fop = &bnkfs_file_fops;
+	unlock_new_inode(inode);
+	return inode;
+}
+
+/* Создать корневой inode (директория). */
+static struct inode *bnkfs_make_root_inode(struct super_block *sb)
+{
+	struct inode *inode = iget_locked(sb, BNKFS_ROOT_INO);
+
+	if (!inode)
+		return NULL;
+	if (!(inode->i_state & I_NEW))
+		return inode;
+
+	inode->i_mode = S_IFDIR | 0755;
+	inode->i_uid  = GLOBAL_ROOT_UID;
+	inode->i_gid  = GLOBAL_ROOT_GID;
+	set_nlink(inode, 2);
+	inode_set_atime_to_ts(inode, current_time(inode));
+	inode_set_mtime_to_ts(inode, current_time(inode));
+	inode_set_ctime_current(inode);
+	inode->i_op  = &bnkfs_dir_iops;
+	inode->i_fop = &bnkfs_dir_fops;
+	unlock_new_inode(inode);
+	return inode;
+}
+
+/* ------------------------------------------------------------- */
+/*               Операции суперблока (VFS-уровень)                 */
+/* ------------------------------------------------------------- */
+
+static void bnkfs_put_super(struct super_block *sb)
+{
+	kfree(sb->s_fs_info);
+	sb->s_fs_info = NULL;
+}
+
+static int bnkfs_statfs(struct dentry *d, struct kstatfs *buf)
+{
+	struct super_block *sb = d->d_sb;
+	struct bnkfs_sb_info *sbi = sb->s_fs_info;
+
+	buf->f_type    = BNKFS_MAGIC;
+	buf->f_bsize   = sb->s_blocksize;
+	buf->f_blocks  = sbi->total_sectors;
+	buf->f_bfree   = 0;
+	buf->f_bavail  = 0;
+	buf->f_files   = sbi->file_count;
+	buf->f_ffree   = 0;
 	buf->f_namelen = sbi->max_name_len;
 	return 0;
 }
 
-static void bnkfs_put_super(struct super_block *sb)
-{
-	struct bnkfs_sb_info *sbi = BNKFS_SB(sb);
-
-	if (!sbi)
-		return;
-
-	mutex_lock(&bnkfs_ctl_lock);
-	if (bnkfs_active_sbi == sbi)
-		bnkfs_active_sbi = NULL;
-	mutex_unlock(&bnkfs_ctl_lock);
-
-	kfree(sbi->files);
-	kfree(sbi);
-	sb->s_fs_info = NULL;
-}
-
-static const struct super_operations bnkfs_super_ops = {
-	.statfs = bnkfs_statfs,
+static const struct super_operations bnkfs_sops = {
+	.statfs    = bnkfs_statfs,
 	.put_super = bnkfs_put_super,
 };
 
-static bool bnkfs_device_matches(struct super_block *sb)
+/* ------------------------------------------------------------- */
+/*                      Mount / fill_super                         */
+/* ------------------------------------------------------------- */
+
+static int bnkfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
-	const char *base = disk_name;
-	const char *slash;
-
-	if (!disk_name || !disk_name[0])
-		return true;
-
-	slash = strrchr(base, '/');
-	if (slash)
-		base = slash + 1;
-	return !strcmp(sb->s_id, base);
-}
-
-static int bnkfs_prepare_super(struct super_block *sb, struct bnkfs_sb_info *sbi)
-{
-	struct bnkfs_disk_super a = { 0 }, b = { 0 };
-	bool va = false, vb = false;
-	bool format_new = false;
-	u64 total_sectors;
-	u64 data_start;
-	int ret;
-
-	ret = bnkfs_read_disk_super(sb, sbi->primary_sector, &a);
-	if (!ret)
-		va = bnkfs_super_valid(&a);
-	ret = bnkfs_read_disk_super(sb, sbi->backup_sector, &b);
-	if (!ret)
-		vb = bnkfs_super_valid(&b);
-
-	if (va) {
-		sbi->dsb = a;
-		if (!vb)
-			return bnkfs_write_disk_super(sb, sbi);
-		return 0;
-	}
-	if (vb) {
-		sbi->dsb = b;
-		return bnkfs_write_disk_super(sb, sbi);
-	}
-
-	total_sectors = bdev_nr_bytes(sb->s_bdev) >> 9;
-	data_start = max_t(u64, sbi->primary_sector, sbi->backup_sector) + 1;
-	if (total_sectors <= data_start)
-		return -ENOSPC;
-
-	memset(&sbi->dsb, 0, sizeof(sbi->dsb));
-	sbi->dsb.magic = cpu_to_le32(BNKFS_MAGIC);
-	sbi->dsb.version = cpu_to_le32(BNKFS_VERSION);
-	sbi->dsb.primary_sector = cpu_to_le64(sbi->primary_sector);
-	sbi->dsb.backup_sector = cpu_to_le64(sbi->backup_sector);
-	sbi->dsb.total_sectors = cpu_to_le64(total_sectors);
-	sbi->dsb.data_start_sector = cpu_to_le64(data_start);
-	sbi->dsb.file_sectors = cpu_to_le32(sbi->file_sectors);
-	sbi->dsb.max_name_len = cpu_to_le32(sbi->max_name_len);
-	sbi->dsb.file_count = cpu_to_le32((total_sectors - data_start) / sbi->file_sectors);
-	format_new = true;
-
-	ret = bnkfs_write_disk_super(sb, sbi);
-	if (ret)
-		return ret;
-	return format_new ? 1 : 0;
-}
-
-static int bnkfs_fill_super(struct super_block *sb, void *data, int silent)
-{
-	(void)data;
-	(void)silent;
-	struct inode *root_inode;
-	struct dentry *root;
 	struct bnkfs_sb_info *sbi;
-	int prep;
-	int ret;
+	struct inode *root;
+	sector_t total_sectors;
+	__u32 data_start, max_files;
+	int err;
 
-	if (!bnkfs_device_matches(sb))
-		return -EINVAL;
+	/* Проверка имени устройства, если пользователь указал disk_name. */
+	if (disk_name && disk_name[0]) {
+		const char *devname = sb->s_bdev ? sb->s_bdev->bd_disk->disk_name : "";
+		/* fc->source содержит путь /dev/xxx; bd_disk->disk_name — короткое имя */
+		if (devname && !strstr(disk_name, devname) && strcmp(disk_name, devname) != 0) {
+			pr_warn("bnkfs: mount на %s, а параметр disk_name=%s — продолжаю всё равно\n",
+				devname, disk_name);
+		}
+	}
 
-	ret = sb_set_blocksize(sb, BNKFS_SECTOR_SIZE);
-	if (!ret)
+	/* Базовая валидация параметров. */
+	if (sb1_offset == sb2_offset) {
+		pr_err("bnkfs: sb1_offset и sb2_offset должны различаться\n");
 		return -EINVAL;
+	}
+	if (max_file_sectors < 1) {
+		pr_err("bnkfs: max_file_sectors должен быть >= 1\n");
+		return -EINVAL;
+	}
+	if (max_name_len < 8 || max_name_len > BNKFS_NAME_MAX - 1) {
+		pr_err("bnkfs: max_name_len должен быть в [8 .. %u]\n", BNKFS_NAME_MAX - 1);
+		return -EINVAL;
+	}
+
+	/* Настраиваем блок-сайз ФС. */
+	if (!sb_set_blocksize(sb, BNKFS_BLOCK_SIZE)) {
+		pr_err("bnkfs: не удалось установить blocksize=%u\n", BNKFS_BLOCK_SIZE);
+		return -EINVAL;
+	}
+
+	total_sectors = bdev_nr_sectors(sb->s_bdev);
+	if (total_sectors < 16) {
+		pr_err("bnkfs: устройство слишком маленькое (%llu секторов)\n",
+		       (unsigned long long)total_sectors);
+		return -ENOSPC;
+	}
+
+	/* Данные начинаются сразу после самой далёкой копии суперблока. */
+	data_start = max(sb1_offset, sb2_offset) + 1;
+	if (data_start >= total_sectors) {
+		pr_err("bnkfs: смещения суперблоков выходят за пределы устройства\n");
+		return -EINVAL;
+	}
+	max_files = (total_sectors - data_start) / max_file_sectors;
+	if (max_files == 0) {
+		pr_err("bnkfs: на устройстве не помещается ни одного файла\n");
+		return -ENOSPC;
+	}
 
 	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
 	if (!sbi)
 		return -ENOMEM;
 
-	mutex_init(&sbi->io_lock);
-	sbi->sb = sb;
-	sbi->primary_sector = sb_primary_sector;
-	sbi->backup_sector = sb_backup_sector;
-	sbi->max_name_len = clamp_t(u32, max_filename_len, 6, BNKFS_IOCTL_NAME_MAX - 1);
-	sbi->file_sectors = max_t(u32, 1, max_file_sectors);
+	sbi->sb1_offset        = sb1_offset;
+	sbi->sb2_offset        = sb2_offset;
+	sbi->data_start_sector = data_start;
+	sbi->file_count        = max_files;
+	sbi->file_sectors      = max_file_sectors;
+	sbi->max_name_len      = max_name_len;
+	sbi->total_sectors     = total_sectors;
 
-	sb->s_magic = BNKFS_MAGIC;
-	sb->s_op = &bnkfs_super_ops;
-	sb->s_maxbytes = MAX_LFS_FILESIZE;
-	sb->s_fs_info = sbi;
-
-	prep = bnkfs_prepare_super(sb, sbi);
-	if (prep < 0) {
-		ret = prep;
-		goto err;
+	/* Подсчитываем, сколько цифр нужно для имён файлов: минимум 4. */
+	{
+		unsigned int digits = 1, tmp = max_files - 1;
+		while (tmp >= 10) { digits++; tmp /= 10; }
+		if (digits < 4)
+			digits = 4;
+		sbi->name_digits = digits;
 	}
 
-	sbi->file_count = le32_to_cpu(sbi->dsb.file_count);
-	sbi->file_sectors = le32_to_cpu(sbi->dsb.file_sectors);
-	sbi->max_name_len = le32_to_cpu(sbi->dsb.max_name_len);
-	if (!sbi->file_count || !sbi->file_sectors || sbi->max_name_len < 6) {
-		ret = -EINVAL;
-		goto err;
+	sb->s_magic     = BNKFS_MAGIC;
+	sb->s_op        = &bnkfs_sops;
+	sb->s_fs_info   = sbi;
+	sb->s_maxbytes  = (loff_t)sbi->file_sectors * BNKFS_SECTOR_SIZE;
+	sb->s_time_gran = 1;
+
+	err = bnkfs_load_or_format(sb, sbi);
+	if (err) {
+		kfree(sbi);
+		sb->s_fs_info = NULL;
+		return err;
 	}
 
-	sbi->files = kcalloc(sbi->file_count, sizeof(*sbi->files), GFP_KERNEL);
-	if (!sbi->files) {
-		ret = -ENOMEM;
-		goto err;
-	}
-
-	ret = bnkfs_fill_entries(sb, sbi, prep == 1);
-	if (ret)
-		goto err;
-
-	root_inode = new_inode(sb);
-	if (!root_inode) {
-		ret = -ENOMEM;
-		goto err;
-	}
-	root_inode->i_ino = 1;
-	inode_init_owner(&nop_mnt_idmap, root_inode, NULL, S_IFDIR | 0555);
-	root_inode->i_fop = &bnkfs_dir_ops;
-	root_inode->i_op = &bnkfs_dir_inode_ops;
-	set_nlink(root_inode, 2);
-
-	root = d_make_root(root_inode);
+	root = bnkfs_make_root_inode(sb);
 	if (!root) {
-		ret = -ENOMEM;
-		goto err;
+		kfree(sbi);
+		sb->s_fs_info = NULL;
+		return -ENOMEM;
 	}
-	sb->s_root = root;
-
-	mutex_lock(&bnkfs_ctl_lock);
-	if (bnkfs_active_sbi) {
-		mutex_unlock(&bnkfs_ctl_lock);
-		ret = -EBUSY;
-		goto err;
+	sb->s_root = d_make_root(root);
+	if (!sb->s_root) {
+		kfree(sbi);
+		sb->s_fs_info = NULL;
+		return -ENOMEM;
 	}
-	bnkfs_active_sbi = sbi;
-	mutex_unlock(&bnkfs_ctl_lock);
 
+	pr_info("bnkfs: смонтировано: total=%llu, data_start=%u, files=%u x %u секторов\n",
+		(unsigned long long)total_sectors, data_start, max_files, max_file_sectors);
 	return 0;
-
-err:
-	bnkfs_put_super(sb);
-	return ret;
 }
 
-static struct dentry *bnkfs_mount(struct file_system_type *fs_type, int flags,
-				  const char *dev_name, void *data)
+/* ------------------------------------------------------------- */
+/*                  fs_context API (ядро 6.x)                      */
+/* ------------------------------------------------------------- */
+
+static int bnkfs_get_tree(struct fs_context *fc)
 {
-	return mount_bdev(fs_type, flags, dev_name, data, bnkfs_fill_super);
+	return get_tree_bdev(fc, bnkfs_fill_super);
+}
+
+static void bnkfs_free_fc(struct fs_context *fc) { }
+
+static const struct fs_context_operations bnkfs_context_ops = {
+	.get_tree = bnkfs_get_tree,
+	.free     = bnkfs_free_fc,
+};
+
+static int bnkfs_init_fs_context(struct fs_context *fc)
+{
+	fc->ops = &bnkfs_context_ops;
+	return 0;
 }
 
 static void bnkfs_kill_sb(struct super_block *sb)
 {
+	/* Сбрасываем буферы перед отмонтированием. */
+	if (sb->s_bdev)
+		sync_blockdev(sb->s_bdev);
 	kill_block_super(sb);
 }
 
-static struct file_system_type bnkfs_fs_type = {
-	.owner = THIS_MODULE,
-	.name = BNKFS_NAME,
-	.mount = bnkfs_mount,
-	.kill_sb = bnkfs_kill_sb,
-	.fs_flags = FS_REQUIRES_DEV,
+static struct file_system_type bnkfs_type = {
+	.owner            = THIS_MODULE,
+	.name             = "bnkfs",
+	.init_fs_context  = bnkfs_init_fs_context,
+	.kill_sb          = bnkfs_kill_sb,
+	.fs_flags         = FS_REQUIRES_DEV,
 };
 
-static long bnkfs_ctl_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-	struct bnkfs_sb_info *sbi;
-	long ret = 0;
-
-	(void)file;
-
-	mutex_lock(&bnkfs_ctl_lock);
-	sbi = bnkfs_active_sbi;
-	if (!sbi) {
-		mutex_unlock(&bnkfs_ctl_lock);
-		return -ENODEV;
-	}
-	mutex_unlock(&bnkfs_ctl_lock);
-
-	mutex_lock(&sbi->io_lock);
-
-	switch (cmd) {
-	case BNKFS_IOC_ZERO_ALL: {
-		u32 i;
-		for (i = 0; i < sbi->file_count; i++) {
-			ret = bnkfs_zero_file(sbi->sb, &sbi->files[i]);
-			if (ret)
-				break;
-		}
-		break;
-	}
-	case BNKFS_IOC_ERASE_FS: {
-		u8 zeros[BNKFS_SECTOR_SIZE];
-		u64 i;
-		u64 total = le64_to_cpu(sbi->dsb.total_sectors);
-
-		memset(zeros, 0, sizeof(zeros));
-		for (i = 0; i < total; i++) {
-			ret = bnkfs_write_raw_sector(sbi->sb, i, zeros);
-			if (ret)
-				break;
-		}
-		if (!ret) {
-			u32 k;
-			for (k = 0; k < sbi->file_count; k++)
-				sbi->files[k].hash = 0;
-		}
-		break;
-	}
-	case BNKFS_IOC_GET_HASHES: {
-		struct bnkfs_ioctl_hash_list req;
-		struct bnkfs_ioctl_hash_entry *entries;
-		u32 i, count;
-
-		if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-			ret = -EFAULT;
-			break;
-		}
-
-		req.total_count = sbi->file_count;
-		count = min(req.capacity, sbi->file_count);
-		req.count = count;
-
-		entries = kcalloc(count, sizeof(*entries), GFP_KERNEL);
-		if (!entries) {
-			ret = -ENOMEM;
-			break;
-		}
-
-		for (i = 0; i < count; i++) {
-			strscpy(entries[i].name, sbi->files[i].name, sizeof(entries[i].name));
-			entries[i].start_sector = sbi->files[i].start_sector;
-			entries[i].sectors = sbi->files[i].sectors;
-			entries[i].hash = sbi->files[i].hash;
-		}
-
-		if (count && copy_to_user((void __user *)(unsigned long)req.entries_ptr, entries,
-					  count * sizeof(*entries)))
-			ret = -EFAULT;
-
-		kfree(entries);
-		if (!ret && copy_to_user((void __user *)arg, &req, sizeof(req)))
-			ret = -EFAULT;
-		break;
-	}
-	case BNKFS_IOC_GET_MAP: {
-		struct bnkfs_ioctl_sector_map_req req;
-		struct bnkfs_file_entry *fe;
-		size_t nlen;
-
-		if (copy_from_user(&req, (void __user *)arg, sizeof(req))) {
-			ret = -EFAULT;
-			break;
-		}
-		req.name[BNKFS_IOCTL_NAME_MAX - 1] = '\0';
-		nlen = strnlen(req.name, BNKFS_IOCTL_NAME_MAX);
-		fe = bnkfs_find_file(sbi, req.name, nlen);
-		if (!fe) {
-			ret = -ENOENT;
-			break;
-		}
-		req.start_sector = fe->start_sector;
-		req.sectors = fe->sectors;
-		if (copy_to_user((void __user *)arg, &req, sizeof(req)))
-			ret = -EFAULT;
-		break;
-	}
-	default:
-		ret = -ENOTTY;
-	}
-
-	mutex_unlock(&sbi->io_lock);
-	return ret;
-}
-
-static const struct file_operations bnkfs_ctl_fops = {
-	.owner = THIS_MODULE,
-	.unlocked_ioctl = bnkfs_ctl_ioctl,
-#ifdef CONFIG_COMPAT
-	.compat_ioctl = bnkfs_ctl_ioctl,
-#endif
-};
-
-static struct miscdevice bnkfs_miscdev = {
-	.minor = MISC_DYNAMIC_MINOR,
-	.name = "bnkfs_ctl",
-	.fops = &bnkfs_ctl_fops,
-	.mode = 0600,
-};
+/* ------------------------------------------------------------- */
+/*                     init / exit модуля                          */
+/* ------------------------------------------------------------- */
 
 static int __init bnkfs_init(void)
 {
-	int ret;
-
-	ret = misc_register(&bnkfs_miscdev);
-	if (ret)
-		return ret;
-
-	ret = register_filesystem(&bnkfs_fs_type);
-	if (ret) {
-		misc_deregister(&bnkfs_miscdev);
-		return ret;
+	int err = register_filesystem(&bnkfs_type);
+	if (err) {
+		pr_err("bnkfs: register_filesystem() = %d\n", err);
+		return err;
 	}
-
-	pr_info("bnkfs: loaded\n");
+	pr_info("bnkfs: загружен. Параметры: disk_name=%s sb1=%u sb2=%u maxname=%u M=%u\n",
+		disk_name, sb1_offset, sb2_offset, max_name_len, max_file_sectors);
 	return 0;
 }
 
 static void __exit bnkfs_exit(void)
 {
-	unregister_filesystem(&bnkfs_fs_type);
-	misc_deregister(&bnkfs_miscdev);
-	pr_info("bnkfs: unloaded\n");
+	unregister_filesystem(&bnkfs_type);
+	pr_info("bnkfs: выгружен\n");
 }
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Codex");
-MODULE_DESCRIPTION("Simple educational FS with duplicated superblock");
 
 module_init(bnkfs_init);
 module_exit(bnkfs_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Bunkevich F.S.");
+MODULE_DESCRIPTION("BunkevichFS — учебная блочная ФС с двумя копиями суперблока");
+MODULE_VERSION("1.0");
