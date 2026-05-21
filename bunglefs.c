@@ -49,10 +49,12 @@ MODULE_PARM_DESC(max_name_len, "Max filename length (<= BUNGLEFS_NAME_LEN)");
 module_param(max_file_sectors, uint, 0444);
 MODULE_PARM_DESC(max_file_sectors, "Max file size in sectors (M, 1..)");
 
+/* ---------------- globals: bdev открывается в module_init ---------------- */
+static struct file         *g_bdev_file;
+static struct block_device *g_bdev;
+
 /* ---------------- in-memory structures ---------------- */
 struct bunglefs_fs_info {
-	struct file              *bdev_file;
-	struct block_device      *bdev;
 	struct bunglefs_dsb      *dsb;
 	struct mutex              lock;
 };
@@ -76,11 +78,11 @@ static __u32 dsb_compute_hash(const struct bunglefs_dsb *dsb)
 	return crc;
 }
 
-static int read_sector(struct block_device *bdev, sector_t sec, void *buf)
+static int read_sector(sector_t sec, void *buf)
 {
 	struct buffer_head *bh;
 
-	bh = __bread(bdev, sec, BUNGLEFS_SECTOR_SIZE);
+	bh = __bread(g_bdev, sec, BUNGLEFS_SECTOR_SIZE);
 	if (!bh)
 		return -EIO;
 	memcpy(buf, bh->b_data, BUNGLEFS_SECTOR_SIZE);
@@ -88,11 +90,11 @@ static int read_sector(struct block_device *bdev, sector_t sec, void *buf)
 	return 0;
 }
 
-static int write_sector(struct block_device *bdev, sector_t sec, const void *buf)
+static int write_sector(sector_t sec, const void *buf)
 {
 	struct buffer_head *bh;
 
-	bh = __getblk(bdev, sec, BUNGLEFS_SECTOR_SIZE);
+	bh = __getblk(g_bdev, sec, BUNGLEFS_SECTOR_SIZE);
 	if (!bh)
 		return -EIO;
 	lock_buffer(bh);
@@ -539,13 +541,12 @@ static const struct file_operations bunglefs_dir_ops = {
 static struct inode *bunglefs_iget(struct super_block *sb, unsigned long ino,
 				   umode_t mode, loff_t size)
 {
-	struct inode *inode = iget_locked(sb, ino);
+	struct inode *inode = new_inode(sb);
 
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
-	if (!(inode->i_state & I_NEW))
-		return inode;
 
+	inode->i_ino   = ino;
 	inode->i_mode  = mode;
 	inode->i_uid   = current_fsuid();
 	inode->i_gid   = current_fsgid();
@@ -559,7 +560,6 @@ static struct inode *bunglefs_iget(struct super_block *sb, unsigned long ino,
 	} else {
 		inode->i_fop  = &bunglefs_file_ops;
 	}
-	unlock_new_inode(inode);
 	return inode;
 }
 
@@ -618,7 +618,6 @@ static int bunglefs_statfs(struct dentry *d, struct kstatfs *buf)
 static const struct super_operations bunglefs_sops = {
 	.put_super   = bunglefs_put_super,
 	.statfs      = bunglefs_statfs,
-	.drop_inode  = generic_delete_inode,
 };
 
 /* ---------------- mount / fs_context ---------------- */
