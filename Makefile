@@ -1,18 +1,23 @@
-obj-m := bunglefs.o
+obj-m += bnkfs.o
 
-KDIR ?= /home/1nflutorm/Downloads/Linux/linux-6.12.90
-PWD   := $(shell pwd)
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
 
-.PHONY: all module cli clean
+CXX ?= g++
+CXXFLAGS ?= -O2 -std=c++20 -Wall -Wextra -pedantic
 
-all: module cli
+.PHONY: all module user clean
+
+all: module user
 
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-cli: cli.cpp bunglefs.h
-	$(CXX) -O2 -Wall -Wextra -std=c++17 -o bunglefs_cli cli.cpp
+user: bnkfs_tool
+
+bnkfs_tool: user_tool.cpp bnkfs_ioctl.h
+	$(CXX) $(CXXFLAGS) user_tool.cpp -o bnkfs_tool
 
 clean:
-	-$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f bunglefs_cli
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f bnkfs_tool
