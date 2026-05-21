@@ -97,8 +97,23 @@ const struct inode_operations bnkfs_dir_iops = {
 
 /* ------------------------- создание inode ------------------------- */
 
+
+static int bnkfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+			 struct iattr *attr)
+{
+	struct inode *inode = d_inode(dentry);
+
+	if (attr->ia_valid & ATTR_SIZE) {
+		if (attr->ia_size != inode->i_size)
+			attr->ia_valid &= ~ATTR_SIZE;
+	}
+	if (attr->ia_valid == 0)
+		return 0;
+	return simple_setattr(idmap, dentry, attr);
+}
+
 const struct inode_operations bnkfs_file_iops = {
-	.setattr = simple_setattr,
+	.setattr = bnkfs_setattr,
 	.getattr = simple_getattr,
 };
 

@@ -138,7 +138,9 @@ count=$(ls "$MNT" | wc -l)
 
 # ------------------------------------------------------------------- #
 step 10 "ioctl zero-all: первый файл должен стать нулевым"
-echo "non-zero" > "$MNT/$first"; sync
+# Пишем без O_TRUNC, чтобы не задевать i_size (файлы фиксированного размера).
+printf 'non-zero-data\n' | dd of="$MNT/$first" bs=1 count=14 conv=notrunc status=none
+sync
 ./user/bnkfs_cli "$MNT" zero-all
 sync
 echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
@@ -156,7 +158,8 @@ echo "unique crc32 values: $uniq_crcs"
 
 # ------------------------------------------------------------------- #
 step 12 "ломаем основной SB, перемонтируем, ожидаем восстановление из копии"
-echo "persistent-payload" > "$MNT/$first"; sync
+printf 'persistent-payload' | dd of="$MNT/$first" bs=1 count=18 conv=notrunc status=none
+sync
 umount "$MNT"
 dd if=/dev/zero of="$LOOP" bs=512 count=1 seek=$SB1 conv=notrunc status=none
 mag1_before=$(xxd -l 4 -s $((SB1 * 512)) "$LOOP" | awk '{print $2$3}')
@@ -169,8 +172,14 @@ dmesg | tail -3
 mag1_after=$(xxd -l 4 -s $((SB1 * 512)) "$LOOP" | awk '{print $2$3}')
 echo "magic primary after : $mag1_after"
 [[ "$mag1_after" == "464b4e42" ]] && ok "repair_primary" || fail "repair_primary"
-content=$(head -c 18 "$MNT/$first")
-[[ "$content" == "persistent-payload" ]] && ok "data_after_repair" || fail "data_after_repair"
+# Сравниваем через файл, чтобы не зависеть от поведения bash с null-байтами.
+dd if="$MNT/$first" bs=1 count=18 status=none of=/tmp/bnkfs_payload
+if cmp -s /tmp/bnkfs_payload <(printf 'persistent-payload'); then
+    ok "data_after_repair"
+else
+    echo "got: $(xxd /tmp/bnkfs_payload | head -1)"
+    fail "data_after_repair"
+fi
 
 # ------------------------------------------------------------------- #
 step 13 "ломаем копию SB, перемонтируем, основной должен по-прежнему работать"
