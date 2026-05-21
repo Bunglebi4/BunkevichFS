@@ -380,7 +380,6 @@ static struct dentry *bnkfs_lookup(struct inode *dir, struct dentry *dentry,
 		inode->i_ino = fe->index + 10;
 		inode_init_owner(&nop_mnt_idmap, inode, dir, S_IFREG | 0644);
 		i_size_write(inode, (loff_t)fe->sectors * BNKFS_SECTOR_SIZE);
-		inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
 		inode->i_fop = &bnkfs_file_ops;
 		inode->i_private = fe;
 	}
@@ -439,18 +438,16 @@ static const struct super_operations bnkfs_super_ops = {
 
 static bool bnkfs_device_matches(struct super_block *sb)
 {
-	char short_name[BDEVNAME_SIZE];
 	const char *base = disk_name;
 	const char *slash;
 
 	if (!disk_name || !disk_name[0])
 		return true;
 
-	bdevname(sb->s_bdev, short_name);
 	slash = strrchr(base, '/');
 	if (slash)
 		base = slash + 1;
-	return !strcmp(short_name, base);
+	return !strcmp(sb->s_id, base);
 }
 
 static int bnkfs_prepare_super(struct super_block *sb, struct bnkfs_sb_info *sbi)
@@ -480,7 +477,7 @@ static int bnkfs_prepare_super(struct super_block *sb, struct bnkfs_sb_info *sbi
 		return bnkfs_write_disk_super(sb, sbi);
 	}
 
-	total_sectors = i_size_read(sb->s_bdev->bd_inode) >> 9;
+	total_sectors = bdev_nr_bytes(sb->s_bdev) >> 9;
 	data_start = max_t(u64, sbi->primary_sector, sbi->backup_sector) + 1;
 	if (total_sectors <= data_start)
 		return -ENOSPC;
@@ -503,9 +500,10 @@ static int bnkfs_prepare_super(struct super_block *sb, struct bnkfs_sb_info *sbi
 	return format_new ? 1 : 0;
 }
 
-static int bnkfs_fill_super(struct super_block *sb, struct fs_context *fc)
+static int bnkfs_fill_super(struct super_block *sb, void *data, int silent)
 {
-	(void)fc;
+	(void)data;
+	(void)silent;
 	struct inode *root_inode;
 	struct dentry *root;
 	struct bnkfs_sb_info *sbi;
@@ -568,7 +566,6 @@ static int bnkfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	inode_init_owner(&nop_mnt_idmap, root_inode, NULL, S_IFDIR | 0555);
 	root_inode->i_fop = &bnkfs_dir_ops;
 	root_inode->i_op = &bnkfs_dir_inode_ops;
-	root_inode->i_atime = root_inode->i_mtime = root_inode->i_ctime = current_time(root_inode);
 	set_nlink(root_inode, 2);
 
 	root = d_make_root(root_inode);
@@ -594,9 +591,10 @@ err:
 	return ret;
 }
 
-static int bnkfs_get_tree(struct fs_context *fc)
+static struct dentry *bnkfs_mount(struct file_system_type *fs_type, int flags,
+				  const char *dev_name, void *data)
 {
-	return get_tree_bdev(fc, bnkfs_fill_super);
+	return mount_bdev(fs_type, flags, dev_name, data, bnkfs_fill_super);
 }
 
 static void bnkfs_kill_sb(struct super_block *sb)
@@ -604,20 +602,10 @@ static void bnkfs_kill_sb(struct super_block *sb)
 	kill_block_super(sb);
 }
 
-static const struct fs_context_operations bnkfs_context_ops = {
-	.get_tree = bnkfs_get_tree,
-};
-
-static int bnkfs_init_fs_context(struct fs_context *fc)
-{
-	fc->ops = &bnkfs_context_ops;
-	return 0;
-}
-
 static struct file_system_type bnkfs_fs_type = {
 	.owner = THIS_MODULE,
 	.name = BNKFS_NAME,
-	.init_fs_context = bnkfs_init_fs_context,
+	.mount = bnkfs_mount,
 	.kill_sb = bnkfs_kill_sb,
 	.fs_flags = FS_REQUIRES_DEV,
 };
