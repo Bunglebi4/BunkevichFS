@@ -198,41 +198,34 @@ static long bfs_op_hashes(struct super_block *sb, void __user *argp)
 {
 	struct bfs_state *st = bfs_state(sb);
 	struct bfs_hashes req;
-	struct bfs_meta *arr = NULL;
+	struct bfs_meta row;
+	char __user *dst;
 	unsigned int i, n;
-	long rc = 0;
+	long rc;
 
 	if (copy_from_user(&req, argp, sizeof(req)))
 		return -EFAULT;
 
 	n = min_t(unsigned int, req.max_count, st->file_count);
-	if (n) {
-		arr = kzalloc(sizeof(*arr) * n, GFP_KERNEL);
-		if (!arr)
-			return -ENOMEM;
-	}
+	dst = (char __user *)(uintptr_t)req.entries;
 
 	for (i = 0; i < n; i++) {
-		bfs_render_name(st, i, arr[i].name, sizeof(arr[i].name));
-		arr[i].start_sector = bfs_file_origin(st, i);
-		arr[i].sector_count = st->file_span;
-		rc = bfs_crc_file(sb, i, &arr[i].hash);
+		memset(&row, 0, sizeof(row));
+		bfs_render_name(st, i, row.name, sizeof(row.name));
+		row.start_sector = bfs_file_origin(st, i);
+		row.sector_count = st->file_span;
+		rc = bfs_crc_file(sb, i, &row.hash);
 		if (rc)
-			goto out;
-	}
-
-	if (n && copy_to_user((void __user *)(uintptr_t)req.entries,
-			      arr, sizeof(*arr) * n)) {
-		rc = -EFAULT;
-		goto out;
+			return rc;
+		if (copy_to_user(dst + (size_t)i * sizeof(row),
+				 &row, sizeof(row)))
+			return -EFAULT;
 	}
 
 	req.count = st->file_count;
 	if (copy_to_user(argp, &req, sizeof(req)))
-		rc = -EFAULT;
-out:
-	kfree(arr);
-	return rc;
+		return -EFAULT;
+	return 0;
 }
 
 static long bfs_op_map(struct super_block *sb, void __user *argp)

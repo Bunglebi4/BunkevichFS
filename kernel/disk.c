@@ -109,29 +109,41 @@ int bfs_mount_or_format(struct super_block *sb, struct bfs_state *st)
 {
 	struct bfs_disk_sb dsb;
 	int a, b;
+	bool from_backup = false;
 
 	a = bfs_sb_fetch(sb, st->sb_a, &dsb);
-	if (a == 0)
-		goto loaded;
-
-	pr_warn("bnkfs: основной суперблок повреждён (err=%d), пробую копию\n", a);
-	b = bfs_sb_fetch(sb, st->sb_b, &dsb);
-	if (b == 0) {
-		pr_info("bnkfs: восстанавливаю основной суперблок из копии\n");
-		bfs_sb_flush(sb, st->sb_a, &dsb);
-		goto loaded;
+	if (a != 0) {
+		pr_warn("bnkfs: основной суперблок невалиден (err=%d), пробую копию\n", a);
+		b = bfs_sb_fetch(sb, st->sb_b, &dsb);
+		if (b != 0) {
+			if (a == -EINVAL && b == -EINVAL) {
+				pr_info("bnkfs: чистое устройство, форматирую\n");
+				return bfs_lay_out(sb, st);
+			}
+			pr_err("bnkfs: суперблок повреждён (err1=%d err2=%d), монтирование отменено\n",
+			       a, b);
+			return -EILSEQ;
+		}
+		from_backup = true;
 	}
 
-	pr_warn("bnkfs: обе копии суперблока невалидны (err1=%d err2=%d), форматирую\n",
-		a, b);
-	return bfs_lay_out(sb, st);
+	if (dsb.total_sectors > st->total_sectors) {
+		pr_err("bnkfs: размер устройства меньше, чем записано в SB (%u < %u)\n",
+		       st->total_sectors, dsb.total_sectors);
+		return -EINVAL;
+	}
 
-loaded:
-	if (dsb.file_count != st->file_count ||
-	    dsb.file_span  != st->file_span  ||
-	    dsb.sb_b       != st->sb_b) {
-		pr_info("bnkfs: параметры ФС изменились, переформатирую\n");
-		return bfs_lay_out(sb, st);
+	st->sb_a        = dsb.sb_a;
+	st->sb_b        = dsb.sb_b;
+	st->data_origin = dsb.data_origin;
+	st->file_count  = dsb.file_count;
+	st->file_span   = dsb.file_span;
+	st->max_name    = dsb.max_name;
+	st->name_digits = dsb.name_digits;
+
+	if (from_backup) {
+		pr_info("bnkfs: восстанавливаю основной суперблок из копии\n");
+		bfs_sb_flush(sb, st->sb_a, &dsb);
 	}
 	return 0;
 }
@@ -168,7 +180,20 @@ static unsigned int bfs_count_digits(unsigned int n)
 	unsigned int d = 1;
 
 	while (n >= 10) { d++; n /= 10; }
-	return d < 4 ? 4 : d;
+	return d;
+}
+
+#define BFS_NAME_PREFIX_LEN 5  /* strlen("file_") */
+
+static unsigned int bfs_max_files_for_name(unsigned int max_name)
+{
+	unsigned int avail = max_name - BFS_NAME_PREFIX_LEN;
+	unsigned int cap = 1;
+	unsigned int i;
+
+	for (i = 0; i < avail && cap <= 1000000000u / 10; i++)
+		cap *= 10;
+	return cap;
 }
 
 int bfs_fill_root_super(struct super_block *sb, struct fs_context *fc)
@@ -192,9 +217,9 @@ int bfs_fill_root_super(struct super_block *sb, struct fs_context *fc)
 		pr_err("bnkfs: max_file_sectors должен быть >= 1\n");
 		return -EINVAL;
 	}
-	if (p_max < 8 || p_max > BFS_MAX_NAME - 1) {
-		pr_err("bnkfs: max_name_len должен быть в [8 .. %u]\n",
-		       BFS_MAX_NAME - 1);
+	if (p_max < BFS_NAME_PREFIX_LEN + 1 || p_max > BFS_MAX_NAME - 1) {
+		pr_err("bnkfs: max_name_len должен быть в [%u .. %u]\n",
+		       BFS_NAME_PREFIX_LEN + 1, BFS_MAX_NAME - 1);
 		return -EINVAL;
 	}
 	if (!sb_set_blocksize(sb, BFS_BLOCK)) {
@@ -218,6 +243,15 @@ int bfs_fill_root_super(struct super_block *sb, struct fs_context *fc)
 	if (!files) {
 		pr_err("bnkfs: на устройстве не помещается ни одного файла\n");
 		return -ENOSPC;
+	}
+	{
+		unsigned int name_cap = bfs_max_files_for_name(p_max);
+
+		if (files > name_cap) {
+			pr_info("bnkfs: количество файлов ограничено %u (max_name_len=%u)\n",
+				name_cap, p_max);
+			files = name_cap;
+		}
 	}
 
 	st = kzalloc(sizeof(*st), GFP_KERNEL);
